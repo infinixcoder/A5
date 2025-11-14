@@ -840,25 +840,289 @@ namespace
         return best ? best->move : dummy;
     }
 
+        inline bool is_valid_move(const CompactBoard &board, const Move &m, uint8_t player,
+                             int rows, int cols, const std::vector<int> &score_cols)
+    {
+        // Validate from position
+        if (m.from.size() != 2 || !in_bounds(m.from[0], m.from[1], rows, cols))
+            return false;
+
+        int sx = m.from[0], sy = m.from[1];
+        int from_idx = sy * cols + sx;
+        uint8_t from_cell = board[from_idx];
+
+        // Check piece ownership and existence
+        if (from_cell == EMPTY || (from_cell & OWNER_MASK) != player)
+            return false;
+
+        uint8_t side = from_cell & SIDE_MASK;
+
+        if (m.action == "move")
+        {
+            if (m.to.size() != 2 || !in_bounds(m.to[0], m.to[1], rows, cols))
+                return false;
+
+            int tx = m.to[0], ty = m.to[1];
+            
+            // Check if destination is opponent's scoring cell
+            if (is_opponent_score_cell(tx, ty, player, rows, cols, score_cols))
+                return false;
+
+            uint8_t target = board[ty * cols + tx];
+
+            // Direct move to empty cell
+            if (target == EMPTY)
+            {
+                // Check adjacency
+                int dx = std::abs(tx - sx), dy = std::abs(ty - sy);
+                return (dx + dy == 1);
+            }
+
+            // Move through river
+            if ((target & SIDE_MASK) == RIVER)
+            {
+                // Check if from position is adjacent to river
+                int dx = std::abs(tx - sx), dy = std::abs(ty - sy);
+                if (dx + dy != 1)
+                    return false;
+
+                // Check if destination is reachable via river flow
+                auto dests = river_flow_destinations(board, tx, ty, sx, sy, player, rows, cols, score_cols, false);
+                for (const auto &d : dests)
+                {
+                    if (d.first == tx && d.second == ty)
+                        return true;
+                }
+                return false;
+            }
+
+            return false;
+        }
+        else if (m.action == "push")
+        {
+            if (m.to.size() != 2 || m.pushed_to.size() != 2)
+                return false;
+            if (!in_bounds(m.to[0], m.to[1], rows, cols))
+                return false;
+            if (!in_bounds(m.pushed_to[0], m.pushed_to[1], rows, cols))
+                return false;
+
+            int tx = m.to[0], ty = m.to[1];
+            int px = m.pushed_to[0], py = m.pushed_to[1];
+
+            // Check adjacency of from to target
+            int dx = tx - sx, dy = ty - sy;
+            if (std::abs(dx) + std::abs(dy) != 1)
+                return false;
+
+            uint8_t target = board[ty * cols + tx];
+            if (target == EMPTY)
+                return false;
+
+            uint8_t pushed_owner = target & OWNER_MASK;
+
+            // Stone pushing
+            if (side == STONE)
+            {
+                if ((target & SIDE_MASK) != STONE)
+                    return false;
+
+                // Pushed position must be in line and adjacent
+                if (px != tx + dx || py != ty + dy)
+                    return false;
+
+                // Destination must be empty
+                if (board[py * cols + px] != EMPTY)
+                    return false;
+
+                // Check scoring area restrictions
+                if (pushed_owner == player)
+                {
+                    // Can't push our piece into opponent's SA
+                    if (is_opponent_score_cell(px, py, player, rows, cols, score_cols))
+                        return false;
+                }
+                else
+                {
+                    // Can't push opponent's piece into our SA
+                    uint8_t opponent = (player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
+                    if (is_opponent_score_cell(px, py, opponent, rows, cols, score_cols))
+                        return false;
+                }
+
+                return true;
+            }
+            // River pushing
+            else if (side == RIVER)
+            {
+                if ((target & SIDE_MASK) != STONE)
+                    return false;
+
+                // Check if pushed_to is reachable via river flow
+                auto dests = river_flow_destinations(board, sx, sy, tx, ty, player, rows, cols, score_cols, true);
+                for (const auto &d : dests)
+                {
+                    if (d.first == px && d.second == py)
+                        return true;
+                }
+                return false;
+            }
+
+            return false;
+        }
+        else if (m.action == "flip")
+        {
+            // Flipping stone to river requires orientation
+            if (side == STONE)
+            {
+                return m.orientation == "horizontal" || m.orientation == "vertical";
+            }
+            // Flipping river to stone
+            else if (side == RIVER)
+            {
+                return true;
+            }
+            return false;
+        }
+        else if (m.action == "rotate")
+        {
+            // Can only rotate rivers
+            return side == RIVER;
+        }
+
+        return false;
+    }
+
 } // namespace
 
 class StudentAgent
 {
 public:
     explicit StudentAgent(std::string side, int history_size = 3)
-        : side(std::move(side)), max_history_size(history_size), move_counter(0) {
-            // Define the opening moves here based on size
-            if (side == "circle") {
-                opening_moves = {
-                    
-                };
-            } else {
-                opening_moves = {
-                    
-                };
-            }
+        : side(std::move(side)), max_history_size(history_size), move_counter(0) {}
 
+    void set_opening_moves_1(int rows, int cols)
+    {
+        if (side == "circle")
+        {
+            opening_moves.push_back({"flip", {4, rows-4}, {}, {}, "horizontal"}); 
+            opening_moves.push_back({"flip", {5, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {6, rows-4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {7, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"move", {8, rows - 4}, {10, rows - 4}, {}, ""});
+            opening_moves.push_back({"move", {3, rows - 4}, {1, rows - 4}, {}, ""});
+            opening_moves.push_back({"flip", {10, rows - 4}, {}, {}, "vertical"});
+            opening_moves.push_back({"flip", {1, rows - 4}, {}, {}, "vertical"});
+            opening_moves.push_back({"move", {4, rows - 5}, {1, 2}, {}, ""});
+            opening_moves.push_back({"move", {7, rows - 5}, {10, 2}, {}, ""});
+            opening_moves.push_back({"flip", {1, 2}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {10, 2}, {}, {}, "horizontal"});
         }
+        else
+        {
+            opening_moves.push_back({"flip", {4, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {5, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {6, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {7, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"move", {8, 3}, {10, 3}, {}, ""});
+            opening_moves.push_back({"move", {3, 3}, {1, 3}, {}, ""});
+            opening_moves.push_back({"flip", {10, 3}, {}, {}, "vertical"});
+            opening_moves.push_back({"flip", {1, 3}, {}, {}, "vertical"});
+            opening_moves.push_back({"move", {4, 4}, {1, 10}, {}, ""}); // Adjusted for 15 rows if rows-3=12
+            opening_moves.push_back({"move", {7, 4}, {10, 10}, {}, ""});
+            opening_moves.push_back({"flip", {1, 10}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {10, 10}, {}, {}, "horizontal"});
+        }
+    }
+
+    void set_opening_moves_2(int rows, int cols)
+    {
+        if (side == "circle")
+        {
+            opening_moves.push_back({"flip", {4, rows-4}, {}, {}, "horizontal"}); 
+            opening_moves.push_back({"flip", {5, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {6, rows-4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {7, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {8, rows - 4}, {}, {}, "horizontal"});
+
+            opening_moves.push_back({"move", {9, rows - 4}, {12, rows - 4}, {}, ""});
+            opening_moves.push_back({"move", {3, rows - 4}, {1, rows - 4}, {}, ""});
+
+            opening_moves.push_back({"flip", {12, rows - 4}, {}, {}, "vertical"});
+            opening_moves.push_back({"flip", {1, rows - 4}, {}, {}, "vertical"});
+
+            opening_moves.push_back({"move", {4, rows - 5}, {1, 2}, {}, ""});
+            opening_moves.push_back({"move", {8, rows - 5}, {12, 2}, {}, ""});
+
+            opening_moves.push_back({"flip", {1, 2}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {12, 2}, {}, {}, "horizontal"});
+        }
+        else
+        {
+            opening_moves.push_back({"flip", {4, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {5, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {6, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {7, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {8, 3}, {}, {}, "horizontal"});
+
+            opening_moves.push_back({"move", {9, 3}, {12, 3}, {}, ""});
+            opening_moves.push_back({"move", {3, 3}, {1, 3}, {}, ""});
+
+            opening_moves.push_back({"flip", {12, 3}, {}, {}, "vertical"});
+            opening_moves.push_back({"flip", {1, 3}, {}, {}, "vertical"});
+
+            opening_moves.push_back({"move", {4, 4}, {1, 12}, {}, ""}); // Adjusted for 15 rows if rows-3=12
+            opening_moves.push_back({"move", {8, 4}, {12, 12}, {}, ""});
+            opening_moves.push_back({"flip", {1, 12}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {12, 12}, {}, {}, "horizontal"});
+        }
+    }
+
+    void set_opening_moves_3(int rows, int cols)
+    {
+        if (side == "circle")
+        {
+            opening_moves.push_back({"flip", {5, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {6, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {7, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {8, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {9, rows - 4}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {10, rows - 4}, {}, {}, "horizontal"});
+
+            opening_moves.push_back({"move", {11, rows - 4}, {14, rows - 4}, {}, ""});
+            opening_moves.push_back({"move", {4, rows - 4}, {1, rows - 4}, {}, ""});
+
+            opening_moves.push_back({"flip", {14, rows - 4}, {}, {}, "vertical"});
+            opening_moves.push_back({"flip", {1, rows - 4}, {}, {}, "vertical"});
+            
+            opening_moves.push_back({"move", {5, rows - 5}, {1, 2}, {}, ""});
+            opening_moves.push_back({"move", {10, rows - 5}, {14, 2}, {}, ""});
+
+            opening_moves.push_back({"flip", {1, 2}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {14, 2}, {}, {}, "horizontal"});
+        }
+        else
+        {
+            opening_moves.push_back({"flip", {5, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {6, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {7, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {8, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {9, 3}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {10, 3}, {}, {}, "horizontal"});
+
+            opening_moves.push_back({"move", {11, 3}, {14, 3}, {}, ""});
+            opening_moves.push_back({"move", {4, 3}, {1, 3}, {}, ""});
+
+            opening_moves.push_back({"flip", {14, 3}, {}, {}, "vertical"});
+            opening_moves.push_back({"flip", {1, 3}, {}, {}, "vertical"});
+
+            opening_moves.push_back({"move", {5, 4}, {1, 14}, {}, ""}); // Adjusted for 15 rows if rows-3=12
+            opening_moves.push_back({"move", {10, 4}, {14, 14}, {}, ""});
+            opening_moves.push_back({"flip", {1, 14}, {}, {}, "horizontal"});
+            opening_moves.push_back({"flip", {14, 14}, {}, {}, "horizontal"});
+        }
+    }
+
 
     std::vector<Move> generate_all_moves(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
                                          int rows, int cols, const std::vector<int> &score_cols) const
@@ -887,6 +1151,13 @@ public:
         // Convert to compact representation for move generation
         CompactBoard board = to_compact(boardIn, rows, cols);
         uint8_t player = (side == "circle") ? OWNER_CIRCLE : OWNER_SQUARE;
+
+        if(move_counter == 0)
+        {
+            if(rows == 13) set_opening_moves_1(rows, cols);
+            if(rows == 15) set_opening_moves_2(rows, cols);
+            if(rows == 17) set_opening_moves_3(rows, cols);
+        }
 
         if(move_counter < (int)opening_moves.size())
         {
@@ -929,7 +1200,7 @@ private:
     int max_history_size;
     std::vector<Move> move_history;
     int move_counter;
-    vector<Move> opening_moves;
+    std::vector<Move> opening_moves;
 
     bool moves_equal(const Move &a, const Move &b) const
     {
