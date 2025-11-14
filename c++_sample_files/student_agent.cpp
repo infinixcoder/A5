@@ -266,6 +266,8 @@ namespace
                             uint8_t opponent = (player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
                             if (is_opponent_score_cell(px, py, opponent, rows, cols, score_cols))
                                 continue;
+
+                            
                         }
 
                         t.pushes.emplace_back(std::make_pair(tx, ty), std::make_pair(px, py));
@@ -352,6 +354,8 @@ namespace
         return cnt;
     }
 
+    // ...existing code...
+
     inline double evaluate_position(const CompactBoard &board, uint8_t root,
                                     int rows, int cols, const std::vector<int> &score_cols, int win_count)
     {
@@ -368,28 +372,105 @@ namespace
             return best;
         };
 
+        // Helper function to evaluate river strategic value
+        auto evaluate_river = [&](int rx, int ry, uint8_t river_owner) -> double
+        {
+            double score = 0.0;
+
+            // Count adjacent pieces that can interact with this river
+            int my_adjacent = 0;
+            int opp_adjacent = 0;
+            std::array<std::pair<int, int>, 4> dirs{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
+
+            for (auto [dx, dy] : dirs)
+            {
+                int ax = rx + dx, ay = ry + dy;
+                if (!in_bounds(ax, ay, rows, cols))
+                    continue;
+
+                uint8_t adj = board[ay * cols + ax];
+                if (adj == EMPTY || (adj & SIDE_MASK) == RIVER)
+                    continue;
+
+                if ((adj & OWNER_MASK) == river_owner)
+                {
+                    my_adjacent++;
+                }
+                else
+                {
+                    opp_adjacent++;
+                }
+            }
+
+            // Score based on adjacent pieces
+            //score += my_adjacent * 0.5;  // More of my pieces can use this river
+            //score -= opp_adjacent * 0.3; // Opponent can also use it
+
+            // Evaluate how close pieces can reach to opponent's scoring area via this river
+            auto dests = river_flow_destinations(board, rx, ry, rx, ry, river_owner, rows, cols, score_cols, false);
+
+            double best_reach = 0.0;
+            int opponent_target_row = (river_owner == OWNER_CIRCLE) ? top_score_row() : bottom_score_row(rows);
+
+            for (auto [dx_dest, dy_dest] : dests)
+            {
+                // How close is this destination to opponent's scoring row?
+                int dist_to_target = std::abs(dy_dest - opponent_target_row);
+                int dist_to_score_col = nearest_dx(dx_dest);
+                double total_dist = dist_to_target + dist_to_score_col;
+
+                // Better rivers reach closer to opponent's scoring area
+                double reach_value = std::exp(-total_dist * 0.4);
+                best_reach = std::max(best_reach, reach_value);
+            }
+
+            score += best_reach * my_adjacent * 0.5; // Weight for strategic positioning
+
+            return score;
+        };
+
         double myScore = 0.0, oppScore = 0.0;
         for (int y = 0; y < rows; ++y)
         {
             for (int x = 0; x < cols; ++x)
             {
                 uint8_t c = board[y * cols + x];
-                if (c == EMPTY || (c & SIDE_MASK) != STONE)
+                if (c == EMPTY)
                     continue;
 
-                if ((c & OWNER_MASK) == root)
+                uint8_t side = c & SIDE_MASK;
+                uint8_t owner = c & OWNER_MASK;
+
+                if (side == STONE)
                 {
-                    int dy = std::abs(y - targetRowMe);
-                    int dx = nearest_dx(x);
-                    double dist = dy + dx;
-                    myScore += std::exp(-dist * 0.3);
+                    if (owner == root)
+                    {
+                        int dy = std::abs(y - targetRowMe);
+                        int dx = nearest_dx(x);
+                        double dist = dy + dx;
+                        myScore += std::exp(-dist * 0.3);
+                    }
+                    else
+                    {
+                        int dy = std::abs(y - targetRowOpp);
+                        int dx = nearest_dx(x);
+                        double dist = dy + dx;
+                        oppScore += std::exp(-dist * 0.3);
+                    }
                 }
-                else
+                else if (side == RIVER)
                 {
-                    int dy = std::abs(y - targetRowOpp);
-                    int dx = nearest_dx(x);
-                    double dist = dy + dx;
-                    oppScore += std::exp(-dist * 0.3);
+                    // Evaluate river's strategic value
+                    double river_value = evaluate_river(x, y, owner);
+
+                    if (owner == root)
+                    {
+                        myScore += river_value;
+                    }
+                    else
+                    {
+                        oppScore += river_value;
+                    }
                 }
             }
         }
@@ -400,6 +481,8 @@ namespace
 
         return myScore / total;
     }
+
+    // ...existing code...
 
     struct MCTSNode
     {
@@ -750,12 +833,30 @@ public:
     {
         int win_count = (int)score_cols.size();
 
-        int time_ms = std::min(100, std::max(100, (int)(my_time * 100)));
+        // Convert to compact representation for move generation
+        CompactBoard board = to_compact(boardIn, rows, cols);
+        uint8_t player = (side == "circle") ? OWNER_CIRCLE : OWNER_SQUARE;
 
+        // Greedy check: if any move increases our stones-in-SA count, play it
+        int before_SA = stones_in_SA(board, player, rows, cols, score_cols);
+        auto all_moves = generate_all_moves_internal(board, player, rows, cols, score_cols);
+
+        for (const auto &m : all_moves)
+        {
+            CompactBoard temp = board;
+            apply_move(temp, m, rows, cols);
+            int after_SA = stones_in_SA(temp, player, rows, cols, score_cols);
+            if (after_SA > before_SA)
+            {
+                std::cout << "GREEDY: Found move that increases scoring count!\n";
+                return m;
+            }
+        }
+
+        // No immediate scoring-increase move found, proceed with MCTS
+        int time_ms = std::min(300, std::max(100, (int)(my_time * 100)));
         Move chosen_move = mcts_search(boardIn, side, rows, cols, score_cols, win_count, std::chrono::milliseconds(time_ms));
-
         add_to_history(chosen_move);
-
         return chosen_move;
     }
 
