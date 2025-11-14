@@ -400,77 +400,43 @@ namespace
     {
         uint8_t opp = (root == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
 
-        auto targetRowMe = (root == OWNER_CIRCLE) ? top_score_row() : bottom_score_row(rows);
-        auto targetRowOpp = (root == OWNER_CIRCLE) ? bottom_score_row(rows) : top_score_row();
+        int targetRowMe = (root == OWNER_CIRCLE) ? top_score_row() : bottom_score_row(rows);
+        int targetRowOpp = (root == OWNER_CIRCLE) ? bottom_score_row(rows) : top_score_row();
 
-        auto nearest_dx = [&](int x)
+        // Pre-compute score column lookup for O(1) access
+        static thread_local std::vector<bool> is_score_col;
+        if (is_score_col.size() != (size_t)cols)
+        {
+            is_score_col.resize(cols, false);
+        }
+        std::fill(is_score_col.begin(), is_score_col.end(), false);
+        for (int c : score_cols)
+            is_score_col[c] = true;
+
+        // Pre-compute nearest distance to score columns for each x coordinate
+        static thread_local std::vector<int> nearest_score_dist;
+        if (nearest_score_dist.size() != (size_t)cols)
+        {
+            nearest_score_dist.resize(cols);
+        }
+        for (int x = 0; x < cols; ++x)
         {
             int best = 1e9;
             for (int c : score_cols)
                 best = std::min(best, std::abs(x - c));
-            return best;
-        };
-
-        // Helper function to evaluate river strategic value
-        auto evaluate_river = [&](int rx, int ry, uint8_t river_owner) -> double
-        {
-            double score = 0.0;
-
-            // Count adjacent pieces that can interact with this river
-            int my_adjacent = 0;
-            int opp_adjacent = 0;
-            std::array<std::pair<int, int>, 4> dirs{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
-
-            for (auto [dx, dy] : dirs)
-            {
-                int ax = rx + dx, ay = ry + dy;
-                if (!in_bounds(ax, ay, rows, cols))
-                    continue;
-
-                uint8_t adj = board[ay * cols + ax];
-                if (adj == EMPTY || (adj & SIDE_MASK) == RIVER)
-                    continue;
-
-                if ((adj & OWNER_MASK) == river_owner)
-                {
-                    my_adjacent++;
-                }
-                else
-                {
-                    opp_adjacent++;
-                }
-            }
-
-            // Score based on adjacent pieces
-            //score += my_adjacent * 0.5;  // More of my pieces can use this river
-            //score -= opp_adjacent * 0.3; // Opponent can also use it
-
-            // Evaluate how close pieces can reach to opponent's scoring area via this river
-            auto dests = river_flow_destinations(board, rx, ry, rx, ry, river_owner, rows, cols, score_cols, false);
-
-            double best_reach = 0.0;
-            int opponent_target_row = (river_owner == OWNER_CIRCLE) ? top_score_row() : bottom_score_row(rows);
-
-            for (auto [dx_dest, dy_dest] : dests)
-            {
-                // How close is this destination to opponent's scoring row?
-                int dist_to_target = std::abs(dy_dest - opponent_target_row);
-                int dist_to_score_col = nearest_dx(dx_dest);
-                double total_dist = dist_to_target + dist_to_score_col;
-
-                // Better rivers reach closer to opponent's scoring area
-                double reach_value = std::exp(-total_dist * 0.4);
-                best_reach = std::max(best_reach, reach_value);
-            }
-
-            score += best_reach * my_adjacent * 0.5; // Weight for strategic positioning
-
-            return score;
-        };
+            nearest_score_dist[x] = best;
+        }
 
         double myScore = 0.0, oppScore = 0.0;
+        int mySA = 0, oppSA = 0;
+        int myRiversInSA = 0, oppRiversInSA = 0;
+
+        // Single pass through the board
         for (int y = 0; y < rows; ++y)
         {
+            bool is_my_score_row = (y == targetRowMe);
+            bool is_opp_score_row = (y == targetRowOpp);
+
             for (int x = 0; x < cols; ++x)
             {
                 uint8_t c = board[y * cols + x];
@@ -479,40 +445,149 @@ namespace
 
                 uint8_t side = c & SIDE_MASK;
                 uint8_t owner = c & OWNER_MASK;
+                bool in_score_col = is_score_col[x];
 
                 if (side == STONE)
                 {
                     if (owner == root)
                     {
-                        int dy = std::abs(y - targetRowMe);
-                        int dx = nearest_dx(x);
-                        double dist = dy + dx;
-                        myScore += std::exp(-dist * 0.3);
+                        // Check if in scoring area (fast check using precomputed flags)
+                        if (is_my_score_row && in_score_col)
+                        {
+                            mySA++;
+                            myScore += 1000.0;
+                        }
+                        else
+                        {
+                            int dy = std::abs(y - targetRowMe);
+                            int dx = nearest_score_dist[x];
+                            double dist = dy + dx;
+
+                            if (dist <= 1)
+                            {
+                                myScore += std::exp(-dist * 0.3) * 10.0;
+                            }
+                            else
+                            {
+                                myScore += std::exp(-dist * 0.3);
+                            }
+                        }
                     }
                     else
                     {
-                        int dy = std::abs(y - targetRowOpp);
-                        int dx = nearest_dx(x);
-                        double dist = dy + dx;
-                        oppScore += std::exp(-dist * 0.3);
+                        if (is_opp_score_row && in_score_col)
+                        {
+                            oppSA++;
+                            oppScore += 1000.0;
+                        }
+                        else
+                        {
+                            int dy = std::abs(y - targetRowOpp);
+                            int dx = nearest_score_dist[x];
+                            double dist = dy + dx;
+
+                            if (dist <= 1)
+                            {
+                                oppScore += std::exp(-dist * 0.3) * 10.0;
+                            }
+                            else
+                            {
+                                oppScore += std::exp(-dist * 0.3);
+                            }
+                        }
                     }
                 }
                 else if (side == RIVER)
                 {
-                    // Evaluate river's strategic value
-                    double river_value = evaluate_river(x, y, owner);
-
-                    if (owner == root)
+                    // Check if river is in scoring area
+                    if (owner == root && is_my_score_row && in_score_col)
                     {
-                        myScore += river_value;
+                        myRiversInSA++;
+                        myScore += 750.0;
+                    }
+                    else if (owner == opp && is_opp_score_row && in_score_col)
+                    {
+                        oppRiversInSA++;
+                        oppScore += 750.0;
                     }
                     else
                     {
-                        oppScore += river_value;
+                        // Simplified river evaluation - avoid expensive river_flow_destinations call
+                        // Use approximation based on position instead
+
+                        int target_row = (owner == OWNER_CIRCLE) ? top_score_row() : bottom_score_row(rows);
+                        int dy = std::abs(y - target_row);
+                        int dx = nearest_score_dist[x];
+
+                        // Base value from distance
+                        double river_value = std::exp(-(dy + dx) * 0.25);
+
+                        // Bonus if in scoring column
+                        if (in_score_col)
+                        {
+                            river_value *= std::exp(0.3 * (rows - dy - 3));
+                        }
+
+                        // Count adjacent stones (quick local check)
+                        int adjacent_stones = 0;
+                        static const int dx_arr[] = {1, -1, 0, 0};
+                        static const int dy_arr[] = {0, 0, 1, -1};
+
+                        for (int d = 0; d < 4; ++d)
+                        {
+                            int ax = x + dx_arr[d];
+                            int ay = y + dy_arr[d];
+                            if (ax >= 0 && ax < cols && ay >= 0 && ay < rows)
+                            {
+                                uint8_t adj = board[ay * cols + ax];
+                                if ((adj & SIDE_MASK) == STONE && (adj & OWNER_MASK) == owner)
+                                {
+                                    adjacent_stones++;
+                                }
+                            }
+                        }
+
+                        // Apply connectivity bonus
+                        river_value *= (1.0 + adjacent_stones * 0.2);
+
+                        // Position bonus
+                        int dist_from_start = (owner == OWNER_CIRCLE)
+                                                  ? y - bottom_score_row(rows)
+                                                  : top_score_row() - y;
+                        if (dist_from_start > 0)
+                        {
+                            river_value *= (1.0 + 0.05 * std::min(dist_from_start, 5));
+                        }
+
+                        if (owner == root)
+                        {
+                            myScore += river_value;
+                        }
+                        else
+                        {
+                            oppScore += river_value;
+                        }
                     }
                 }
             }
         }
+
+        // Apply exponential scaling only if there are stones in SA
+        if (mySA > 0)
+        {
+            myScore *= std::exp(mySA * 1.2);
+        }
+
+        if (oppSA > 0)
+        {
+            oppScore *= std::exp(oppSA * 1.2);
+        }
+
+        if (myRiversInSA > 0)
+            myScore *= std::exp(myRiversInSA * 0.5);
+
+        if (oppRiversInSA > 0)
+            oppScore *= std::exp(oppRiversInSA * 0.5);
 
         double total = myScore + oppScore;
         if (total < 1e-9)
@@ -521,479 +596,486 @@ namespace
         return myScore / total;
     }
 
-    // ...existing code...
+        // ...existing code...
 
-    struct MCTSNode
-    {
-        CompactBoard board;
-        Move move;
-        MCTSNode *parent;
-        std::vector<std::unique_ptr<MCTSNode>> children;
-        int visits;
-        double wins;
-        bool is_fully_expanded;
-        uint8_t player_to_move;
-        std::vector<Move> untried_moves;
-
-        MCTSNode(const CompactBoard &b, const Move &m, MCTSNode *p, uint8_t player)
-            : board(b), move(m), parent(p), visits(0), wins(0.0),
-              is_fully_expanded(false), player_to_move(player) {}
-
-        bool is_terminal(int rows, int cols, const std::vector<int> &score_cols, int win_count) const
+        struct MCTSNode
         {
-            int circleSA = stones_in_SA(board, OWNER_CIRCLE, rows, cols, score_cols);
-            int squareSA = stones_in_SA(board, OWNER_SQUARE, rows, cols, score_cols);
-            return circleSA >= win_count || squareSA >= win_count;
-        }
+            CompactBoard board;
+            Move move;
+            MCTSNode *parent;
+            std::vector<std::unique_ptr<MCTSNode>> children;
+            int visits;
+            double wins;
+            bool is_fully_expanded;
+            uint8_t player_to_move;
+            std::vector<Move> untried_moves;
 
-        double ucb1(double exploration_constant = 1.414) const
-        {
-            if (visits == 0)
-                return std::numeric_limits<double>::infinity();
-            return (wins / visits) + exploration_constant * std::sqrt(std::log(parent->visits) / visits);
-        }
+            MCTSNode(const CompactBoard &b, const Move &m, MCTSNode *p, uint8_t player)
+                : board(b), move(m), parent(p), visits(0), wins(0.0),
+                  is_fully_expanded(false), player_to_move(player) {}
 
-        MCTSNode *select_child()
-        {
-            MCTSNode *best = nullptr;
-            double best_ucb = -std::numeric_limits<double>::infinity();
-            for (auto &child : children)
+            bool is_terminal(int rows, int cols, const std::vector<int> &score_cols, int win_count) const
             {
-                double ucb = child->ucb1();
-                if (ucb > best_ucb)
-                {
-                    best_ucb = ucb;
-                    best = child.get();
-                }
+                int circleSA = stones_in_SA(board, OWNER_CIRCLE, rows, cols, score_cols);
+                int squareSA = stones_in_SA(board, OWNER_SQUARE, rows, cols, score_cols);
+                return circleSA >= win_count || squareSA >= win_count;
             }
-            return best;
-        }
-    };
 
-    std::vector<Move> generate_all_moves_internal(const CompactBoard &board, uint8_t player,
-                                                  int rows, int cols, const std::vector<int> &score_cols)
-    {
-        std::vector<Move> out;
-        out.reserve(512);
-
-        for (int y = 0; y < rows; ++y)
-        {
-            for (int x = 0; x < cols; ++x)
+            double ucb1(double exploration_constant = 1.414) const
             {
-                uint8_t cell = board[y * cols + x];
-                if (cell == EMPTY || (cell & OWNER_MASK) != player)
-                    continue;
+                if (visits == 0)
+                    return std::numeric_limits<double>::infinity();
+                return (wins / visits) + exploration_constant * std::sqrt(std::log(parent->visits) / visits);
+            }
 
-                Targets tg = compute_valid_targets(board, x, y, player, rows, cols, score_cols);
-                for (auto &mv : tg.moves)
+            MCTSNode *select_child()
+            {
+                MCTSNode *best = nullptr;
+                double best_ucb = -std::numeric_limits<double>::infinity();
+                for (auto &child : children)
                 {
-                    Move m;
-                    m.action = "move";
-                    m.from = {x, y};
-                    m.to = {mv.first, mv.second};
-                    out.push_back(m);
+                    double ucb = child->ucb1();
+                    if (ucb > best_ucb)
+                    {
+                        best_ucb = ucb;
+                        best = child.get();
+                    }
                 }
-                for (auto &pp : tg.pushes)
-                {
-                    Move m;
-                    m.action = "push";
-                    m.from = {x, y};
-                    m.to = {pp.first.first, pp.first.second};
-                    m.pushed_to = {pp.second.first, pp.second.second};
-                    out.push_back(m);
-                }
+                return best;
+            }
+        };
 
-                if ((cell & SIDE_MASK) == STONE)
+        std::vector<Move> generate_all_moves_internal(const CompactBoard &board, uint8_t player,
+                                                      int rows, int cols, const std::vector<int> &score_cols)
+        {
+            std::vector<Move> out;
+            out.reserve(512);
+
+            for (int y = 0; y < rows; ++y)
+            {
+                for (int x = 0; x < cols; ++x)
                 {
-                    for (auto ori : {"horizontal", "vertical"})
+                    uint8_t cell = board[y * cols + x];
+                    if (cell == EMPTY || (cell & OWNER_MASK) != player)
+                        continue;
+
+                    Targets tg = compute_valid_targets(board, x, y, player, rows, cols, score_cols);
+                    for (auto &mv : tg.moves)
+                    {
+                        Move m;
+                        m.action = "move";
+                        m.from = {x, y};
+                        m.to = {mv.first, mv.second};
+                        out.push_back(m);
+                    }
+                    for (auto &pp : tg.pushes)
+                    {
+                        Move m;
+                        m.action = "push";
+                        m.from = {x, y};
+                        m.to = {pp.first.first, pp.first.second};
+                        m.pushed_to = {pp.second.first, pp.second.second};
+                        out.push_back(m);
+                    }
+
+                    if ((cell & SIDE_MASK) == STONE)
+                    {
+                        for (auto ori : {"horizontal", "vertical"})
+                        {
+                            Move m;
+                            m.action = "flip";
+                            m.from = {x, y};
+                            m.orientation = ori;
+                            out.push_back(m);
+                        }
+                    }
+                    else
                     {
                         Move m;
                         m.action = "flip";
                         m.from = {x, y};
-                        m.orientation = ori;
                         out.push_back(m);
+
+                        Move r;
+                        r.action = "rotate";
+                        r.from = {x, y};
+                        out.push_back(r);
                     }
                 }
-                else
-                {
-                    Move m;
-                    m.action = "flip";
-                    m.from = {x, y};
-                    out.push_back(m);
-
-                    Move r;
-                    r.action = "rotate";
-                    r.from = {x, y};
-                    out.push_back(r);
-                }
             }
+            return out;
         }
-        return out;
-    }
 
-    MCTSNode *expand(MCTSNode *node, int rows, int cols, const std::vector<int> &score_cols, int win_count)
-    {
-        if (node->untried_moves.empty())
+        MCTSNode *expand(MCTSNode * node, int rows, int cols, const std::vector<int> &score_cols, int win_count)
         {
-            node->untried_moves = generate_all_moves_internal(node->board, node->player_to_move, rows, cols, score_cols);
             if (node->untried_moves.empty())
             {
+                node->untried_moves = generate_all_moves_internal(node->board, node->player_to_move, rows, cols, score_cols);
+                if (node->untried_moves.empty())
+                {
+                    node->is_fully_expanded = true;
+                    return node;
+                }
+
+                // Sort moves by heuristic evaluation (best first)
+                std::sort(node->untried_moves.begin(), node->untried_moves.end(),
+                          [&](const Move &a, const Move &b)
+                          {
+                              CompactBoard board_a = node->board, board_b = node->board;
+                              apply_move(board_a, a, rows, cols);
+                              apply_move(board_b, b, rows, cols);
+
+                              double eval_a = evaluate_position(board_a, node->player_to_move, rows, cols, score_cols, win_count);
+                              double eval_b = evaluate_position(board_b, node->player_to_move, rows, cols, score_cols, win_count);
+
+                              return eval_a > eval_b;
+                          });
+            }
+
+            // Take the best untried move (front of sorted list)
+            Move move = node->untried_moves.front();
+            node->untried_moves.erase(node->untried_moves.begin());
+
+            if (node->untried_moves.empty())
                 node->is_fully_expanded = true;
-                return node;
-            }
 
-            // Sort moves by heuristic evaluation (best first)
-            std::sort(node->untried_moves.begin(), node->untried_moves.end(),
-                      [&](const Move &a, const Move &b)
-                      {
-                          CompactBoard board_a = node->board, board_b = node->board;
-                          apply_move(board_a, a, rows, cols);
-                          apply_move(board_b, b, rows, cols);
+            auto new_board = node->board;
+            apply_move(new_board, move, rows, cols);
 
-                          double eval_a = evaluate_position(board_a, node->player_to_move, rows, cols, score_cols, win_count);
-                          double eval_b = evaluate_position(board_b, node->player_to_move, rows, cols, score_cols, win_count);
+            uint8_t next_player = (node->player_to_move == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
+            auto child = std::make_unique<MCTSNode>(new_board, move, node, next_player);
+            MCTSNode *child_ptr = child.get();
+            node->children.push_back(std::move(child));
 
-                          return eval_a > eval_b;
-                      });
+            return child_ptr;
         }
 
-        // Take the best untried move (front of sorted list)
-        Move move = node->untried_moves.front();
-        node->untried_moves.erase(node->untried_moves.begin());
-
-        if (node->untried_moves.empty())
-            node->is_fully_expanded = true;
-
-        auto new_board = node->board;
-        apply_move(new_board, move, rows, cols);
-
-        uint8_t next_player = (node->player_to_move == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
-        auto child = std::make_unique<MCTSNode>(new_board, move, node, next_player);
-        MCTSNode *child_ptr = child.get();
-        node->children.push_back(std::move(child));
-
-        return child_ptr;
-    }
-
-    double simulate(const CompactBoard &start_board, uint8_t current_player, uint8_t root_player,
-                    int rows, int cols, const std::vector<int> &score_cols, int win_count)
-    {
-        auto board = start_board;
-        static std::mt19937 rng(std::random_device{}());
-
-        // Adaptive depth based on how close we are to winning
-        int circleSA = stones_in_SA(start_board, OWNER_CIRCLE, rows, cols, score_cols);
-        int squareSA = stones_in_SA(start_board, OWNER_SQUARE, rows, cols, score_cols);
-
-        int max_stones = std::max(circleSA, squareSA);
-        int stones_needed = win_count - max_stones;
-
-        // More depth if we're far from winning, less if close
-        //int max_depth = stones_needed > 3 ? 30 : 15;
-        int max_depth = stones_needed > 3 ? 3 : 3;
-
-        double prev_eval = evaluate_position(board, root_player, rows, cols, score_cols, win_count);
-
-        for (int depth = 0; depth < max_depth; ++depth)
+        double simulate(const CompactBoard &start_board, uint8_t current_player, uint8_t root_player,
+                        int rows, int cols, const std::vector<int> &score_cols, int win_count)
         {
-            circleSA = stones_in_SA(board, OWNER_CIRCLE, rows, cols, score_cols);
-            squareSA = stones_in_SA(board, OWNER_SQUARE, rows, cols, score_cols);
+            auto board = start_board;
+            static std::mt19937 rng(std::random_device{}());
 
-            if (circleSA >= win_count)
-                return (root_player == OWNER_CIRCLE) ? 1.0 : 0.0;
-            if (squareSA >= win_count)
-                return (root_player == OWNER_SQUARE) ? 1.0 : 0.0;
+            // Adaptive depth based on how close we are to winning
+            int circleSA = stones_in_SA(start_board, OWNER_CIRCLE, rows, cols, score_cols);
+            int squareSA = stones_in_SA(start_board, OWNER_SQUARE, rows, cols, score_cols);
 
-            auto moves = generate_all_moves_internal(board, current_player, rows, cols, score_cols);
-            if (moves.empty())
-                break;
+            int max_stones = std::max(circleSA, squareSA);
+            int stones_needed = win_count - max_stones;
 
-            // Epsilon-greedy strategy (80% greedy, 20% random)
-            Move move;
-            std::uniform_real_distribution<double> epsilon_dist(0.0, 1.0);
+            // More depth if we're far from winning, less if close
+            // int max_depth = stones_needed > 3 ? 30 : 15;
+            int max_depth = stones_needed > 3 ? 3 : 3;
 
-            if (epsilon_dist(rng) < 1.0 && moves.size() > 1)
+            double prev_eval = evaluate_position(board, root_player, rows, cols, score_cols, win_count);
+
+            for (int depth = 0; depth < max_depth; ++depth)
             {
-                // Greedy: pick best move according to heuristic
-                double best_eval = -1.0;
-                size_t best_idx = 0;
+                circleSA = stones_in_SA(board, OWNER_CIRCLE, rows, cols, score_cols);
+                squareSA = stones_in_SA(board, OWNER_SQUARE, rows, cols, score_cols);
 
-                // Check top 10 moves to balance speed and quality
-                size_t check_count = std::min(moves.size(), size_t(10));
-                for (size_t i = 0; i < check_count; ++i)
-                {
-                    CompactBoard temp = board;
-                    apply_move(temp, moves[i], rows, cols);
-                    double eval = evaluate_position(temp, current_player, rows, cols, score_cols, win_count);
+                if (circleSA >= win_count)
+                    return (root_player == OWNER_CIRCLE) ? 1.0 : 0.0;
+                if (squareSA >= win_count)
+                    return (root_player == OWNER_SQUARE) ? 1.0 : 0.0;
 
-                    if (eval > best_eval)
-                    {
-                        best_eval = eval;
-                        best_idx = i;
-                    }
-                }
-                move = moves[best_idx];
-            }
-            else
-            {
-                // Random exploration
-                std::uniform_int_distribution<size_t> dist(0, moves.size() - 1);
-                move = moves[dist(rng)];
-            }
-
-            apply_move(board, move, rows, cols);
-            current_player = (current_player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
-
-            // Early termination based on evaluation
-            if (depth % 5 == 0 && depth > 0)
-            {
-                double curr_eval = evaluate_position(board, root_player, rows, cols, score_cols, win_count);
-
-                // If evaluation is extreme (very good or very bad), stop early
-                if (curr_eval > 0.95 || curr_eval < 0.05)
-                    return curr_eval;
-
-                // If evaluation hasn't changed much, the position is stable
-                if (std::abs(curr_eval - prev_eval) < 0.05)
-                    return curr_eval;
-
-                prev_eval = curr_eval;
-            }
-        }
-
-        return evaluate_position(board, root_player, rows, cols, score_cols, win_count);
-    }
-
-    void backpropagate(MCTSNode *node, double result)
-    {
-        while (node != nullptr)
-        {
-            node->visits++;
-            node->wins += result;
-            result = 1.0 - result;
-            node = node->parent;
-        }
-    }
-
-    Move mcts_search(const std::vector<std::vector<std::map<std::string, std::string>>> &board_str,
-                     const std::string &player_str, int rows, int cols, const std::vector<int> &score_cols,
-                     int win_count, std::chrono::milliseconds time_limit)
-    {
-        // Convert to compact representation
-        CompactBoard board = to_compact(board_str, rows, cols);
-        uint8_t player = (player_str == "circle") ? OWNER_CIRCLE : OWNER_SQUARE;
-
-        auto deadline = std::chrono::steady_clock::now() + time_limit;
-
-        Move dummy;
-        dummy.action = "move";
-        dummy.from = {0, 0};
-        dummy.to = {0, 0};
-
-        MCTSNode root(board, dummy, nullptr, player);
-
-        int iterations = 0;
-        while (std::chrono::steady_clock::now() < deadline)
-        {
-            MCTSNode *node = &root;
-            while (!node->is_terminal(rows, cols, score_cols, win_count) && node->is_fully_expanded)
-            {
-                node = node->select_child();
-                if (node == nullptr)
+                auto moves = generate_all_moves_internal(board, current_player, rows, cols, score_cols);
+                if (moves.empty())
                     break;
-            }
 
-            if (node == nullptr)
-                break;
+                // Epsilon-greedy strategy (80% greedy, 20% random)
+                Move move;
+                std::uniform_real_distribution<double> epsilon_dist(0.0, 1.0);
 
-            if (!node->is_terminal(rows, cols, score_cols, win_count) && !node->is_fully_expanded)
-            {
-                node = expand(node, rows, cols, score_cols, win_count);
-            }
-
-            double result = simulate(node->board, node->player_to_move, player, rows, cols, score_cols, win_count);
-
-            backpropagate(node, result);
-
-            iterations++;
-        }
-
-        std::cout << "MCTS iterations: " << iterations << std::endl;
-
-        if (root.children.empty())
-        {
-            auto moves = generate_all_moves_internal(board, player, rows, cols, score_cols);
-            return moves.empty() ? dummy : moves[0];
-        }
-
-        MCTSNode *best = nullptr;
-        int best_visits = -1;
-        for (auto &child : root.children)
-        {
-            if (child->visits > best_visits)
-            {
-                best_visits = child->visits;
-                best = child.get();
-            }
-        }
-
-        return best ? best->move : dummy;
-    }
-
-        inline bool is_valid_move(const CompactBoard &board, const Move &m, uint8_t player,
-                             int rows, int cols, const std::vector<int> &score_cols)
-    {
-        // Validate from position
-        if (m.from.size() != 2 || !in_bounds(m.from[0], m.from[1], rows, cols))
-            return false;
-
-        int sx = m.from[0], sy = m.from[1];
-        int from_idx = sy * cols + sx;
-        uint8_t from_cell = board[from_idx];
-
-        // Check piece ownership and existence
-        if (from_cell == EMPTY || (from_cell & OWNER_MASK) != player)
-            return false;
-
-        uint8_t side = from_cell & SIDE_MASK;
-
-        if (m.action == "move")
-        {
-            if (m.to.size() != 2 || !in_bounds(m.to[0], m.to[1], rows, cols))
-                return false;
-
-            int tx = m.to[0], ty = m.to[1];
-            
-            // Check if destination is opponent's scoring cell
-            if (is_opponent_score_cell(tx, ty, player, rows, cols, score_cols))
-                return false;
-
-            uint8_t target = board[ty * cols + tx];
-
-            // Direct move to empty cell
-            if (target == EMPTY)
-            {
-                // Check adjacency
-                int dx = std::abs(tx - sx), dy = std::abs(ty - sy);
-                return (dx + dy == 1);
-            }
-
-            // Move through river
-            if ((target & SIDE_MASK) == RIVER)
-            {
-                // Check if from position is adjacent to river
-                int dx = std::abs(tx - sx), dy = std::abs(ty - sy);
-                if (dx + dy != 1)
-                    return false;
-
-                // Check if destination is reachable via river flow
-                auto dests = river_flow_destinations(board, tx, ty, sx, sy, player, rows, cols, score_cols, false);
-                for (const auto &d : dests)
+                if (epsilon_dist(rng) < 1.0 && moves.size() > 1)
                 {
-                    if (d.first == tx && d.second == ty)
-                        return true;
-                }
-                return false;
-            }
+                    // Greedy: pick best move according to heuristic
+                    double best_eval = -1.0;
+                    size_t best_idx = 0;
 
-            return false;
-        }
-        else if (m.action == "push")
-        {
-            if (m.to.size() != 2 || m.pushed_to.size() != 2)
-                return false;
-            if (!in_bounds(m.to[0], m.to[1], rows, cols))
-                return false;
-            if (!in_bounds(m.pushed_to[0], m.pushed_to[1], rows, cols))
-                return false;
+                    // Check top 10 moves to balance speed and quality
+                    size_t check_count = std::min(moves.size(), size_t(10));
+                    for (size_t i = 0; i < check_count; ++i)
+                    {
+                        CompactBoard temp = board;
+                        apply_move(temp, moves[i], rows, cols);
+                        double eval = evaluate_position(temp, current_player, rows, cols, score_cols, win_count);
 
-            int tx = m.to[0], ty = m.to[1];
-            int px = m.pushed_to[0], py = m.pushed_to[1];
-
-            // Check adjacency of from to target
-            int dx = tx - sx, dy = ty - sy;
-            if (std::abs(dx) + std::abs(dy) != 1)
-                return false;
-
-            uint8_t target = board[ty * cols + tx];
-            if (target == EMPTY)
-                return false;
-
-            uint8_t pushed_owner = target & OWNER_MASK;
-
-            // Stone pushing
-            if (side == STONE)
-            {
-                if ((target & SIDE_MASK) != STONE)
-                    return false;
-
-                // Pushed position must be in line and adjacent
-                if (px != tx + dx || py != ty + dy)
-                    return false;
-
-                // Destination must be empty
-                if (board[py * cols + px] != EMPTY)
-                    return false;
-
-                // Check scoring area restrictions
-                if (pushed_owner == player)
-                {
-                    // Can't push our piece into opponent's SA
-                    if (is_opponent_score_cell(px, py, player, rows, cols, score_cols))
-                        return false;
+                        if (eval > best_eval)
+                        {
+                            best_eval = eval;
+                            best_idx = i;
+                        }
+                    }
+                    move = moves[best_idx];
                 }
                 else
                 {
-                    // Can't push opponent's piece into our SA
-                    uint8_t opponent = (player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
-                    if (is_opponent_score_cell(px, py, opponent, rows, cols, score_cols))
-                        return false;
+                    // Random exploration
+                    std::uniform_int_distribution<size_t> dist(0, moves.size() - 1);
+                    move = moves[dist(rng)];
                 }
 
-                return true;
+                apply_move(board, move, rows, cols);
+                current_player = (current_player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
+
+                // Early termination based on evaluation
+                if (depth % 5 == 0 && depth > 0)
+                {
+                    double curr_eval = evaluate_position(board, root_player, rows, cols, score_cols, win_count);
+
+                    // If evaluation is extreme (very good or very bad), stop early
+                    if (curr_eval > 0.95 || curr_eval < 0.05)
+                        return curr_eval;
+
+                    // If evaluation hasn't changed much, the position is stable
+                    if (std::abs(curr_eval - prev_eval) < 0.05)
+                        return curr_eval;
+
+                    prev_eval = curr_eval;
+                }
             }
-            // River pushing
-            else if (side == RIVER)
+
+            return evaluate_position(board, root_player, rows, cols, score_cols, win_count);
+        }
+
+        void backpropagate(MCTSNode * node, double result)
+        {
+            while (node != nullptr)
             {
-                if ((target & SIDE_MASK) != STONE)
+                node->visits++;
+                node->wins += result;
+                result = 1.0 - result;
+                node = node->parent;
+            }
+        }
+
+        Move mcts_search(const std::vector<std::vector<std::map<std::string, std::string>>> &board_str,
+                         const std::string &player_str, int rows, int cols, const std::vector<int> &score_cols,
+                         int win_count, std::chrono::milliseconds time_limit)
+        {
+            // Convert to compact representation
+            CompactBoard board = to_compact(board_str, rows, cols);
+            uint8_t player = (player_str == "circle") ? OWNER_CIRCLE : OWNER_SQUARE;
+
+            auto deadline = std::chrono::steady_clock::now() + time_limit;
+
+            Move dummy;
+            dummy.action = "move";
+            dummy.from = {0, 0};
+            dummy.to = {0, 0};
+
+            MCTSNode root(board, dummy, nullptr, player);
+
+            int iterations = 0;
+            while (std::chrono::steady_clock::now() < deadline)
+            {
+                MCTSNode *node = &root;
+                while (!node->is_terminal(rows, cols, score_cols, win_count) && node->is_fully_expanded)
+                {
+                    node = node->select_child();
+                    if (node == nullptr)
+                        break;
+                }
+
+                if (node == nullptr)
+                    break;
+
+                if (!node->is_terminal(rows, cols, score_cols, win_count) && !node->is_fully_expanded)
+                {
+                    node = expand(node, rows, cols, score_cols, win_count);
+                }
+
+                double result = simulate(node->board, node->player_to_move, player, rows, cols, score_cols, win_count);
+
+                backpropagate(node, result);
+
+                iterations++;
+            }
+
+            std::cout << "MCTS iterations: " << iterations << std::endl;
+
+            if (root.children.empty())
+            {
+                auto moves = generate_all_moves_internal(board, player, rows, cols, score_cols);
+                return moves.empty() ? dummy : moves[0];
+            }
+
+            MCTSNode *best = nullptr;
+            int best_visits = -1;
+            for (auto &child : root.children)
+            {
+                if (child->visits > best_visits)
+                {
+                    best_visits = child->visits;
+                    best = child.get();
+                }
+            }
+
+            return best ? best->move : dummy;
+        }
+
+        inline bool is_valid_move(const CompactBoard &board, const Move &m, uint8_t player,
+                                  int rows, int cols, const std::vector<int> &score_cols)
+        {
+            // Validate from position
+            if (m.from.size() != 2 || !in_bounds(m.from[0], m.from[1], rows, cols))
+                return false;
+
+            int sx = m.from[0], sy = m.from[1];
+            int from_idx = sy * cols + sx;
+            uint8_t from_cell = board[from_idx];
+
+            // Check piece ownership and existence
+            if (from_cell == EMPTY || (from_cell & OWNER_MASK) != player)
+                return false;
+
+            uint8_t side = from_cell & SIDE_MASK;
+
+            if (m.action == "move")
+            {
+                if (m.to.size() != 2 || !in_bounds(m.to[0], m.to[1], rows, cols))
                     return false;
 
-                // Check if pushed_to is reachable via river flow
-                auto dests = river_flow_destinations(board, sx, sy, tx, ty, player, rows, cols, score_cols, true);
-                for (const auto &d : dests)
+                int tx = m.to[0], ty = m.to[1];
+
+                // Check if destination is opponent's scoring cell
+                if (is_opponent_score_cell(tx, ty, player, rows, cols, score_cols))
+                    return false;
+
+                uint8_t target = board[ty * cols + tx];
+
+                // Target must be empty for a valid move
+                if (target != EMPTY)
+                    return false;
+
+                // Check if target is adjacent to source
+                int dx = std::abs(tx - sx), dy = std::abs(ty - sy);
+                if (dx + dy == 1)
+                    return true;
+
+                // Target is not adjacent, check if reachable via rivers
+                std::array<std::pair<int, int>, 4> dirs{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
+
+                for (auto [dirx, diry] : dirs)
                 {
-                    if (d.first == px && d.second == py)
-                        return true;
+                    int rx = sx + dirx, ry = sy + diry;
+
+                    // Check if there's a river adjacent to source
+                    if (!in_bounds(rx, ry, rows, cols))
+                        continue;
+
+                    uint8_t adj_cell = board[ry * cols + rx];
+                    if ((adj_cell & SIDE_MASK) != RIVER)
+                        continue;
+
+                    // Found an adjacent river, check if target is reachable from it
+                    auto dests = river_flow_destinations(board, rx, ry, sx, sy, player, rows, cols, score_cols, false);
+                    for (const auto &d : dests)
+                    {
+                        if (d.first == tx && d.second == ty)
+                            return true;
+                    }
+                }
+
+                return false;
+            }
+            else if (m.action == "push")
+            {
+                if (m.to.size() != 2 || m.pushed_to.size() != 2)
+                    return false;
+                if (!in_bounds(m.to[0], m.to[1], rows, cols))
+                    return false;
+                if (!in_bounds(m.pushed_to[0], m.pushed_to[1], rows, cols))
+                    return false;
+
+                int tx = m.to[0], ty = m.to[1];
+                int px = m.pushed_to[0], py = m.pushed_to[1];
+
+                // Check adjacency of from to target
+                int dx = tx - sx, dy = ty - sy;
+                if (std::abs(dx) + std::abs(dy) != 1)
+                    return false;
+
+                uint8_t target = board[ty * cols + tx];
+                if (target == EMPTY)
+                    return false;
+
+                uint8_t pushed_owner = target & OWNER_MASK;
+
+                // Stone pushing
+                if (side == STONE)
+                {
+                    if ((target & SIDE_MASK) != STONE)
+                        return false;
+
+                    // Pushed position must be in line and adjacent
+                    if (px != tx + dx || py != ty + dy)
+                        return false;
+
+                    // Destination must be empty
+                    if (board[py * cols + px] != EMPTY)
+                        return false;
+
+                    // Check scoring area restrictions
+                    if (pushed_owner == player)
+                    {
+                        // Can't push our piece into opponent's SA
+                        if (is_opponent_score_cell(px, py, player, rows, cols, score_cols))
+                            return false;
+                    }
+                    else
+                    {
+                        // Can't push opponent's piece into our SA
+                        uint8_t opponent = (player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
+                        if (is_opponent_score_cell(px, py, opponent, rows, cols, score_cols))
+                            return false;
+                    }
+
+                    return true;
+                }
+                // River pushing
+                else if (side == RIVER)
+                {
+                    if ((target & SIDE_MASK) != STONE)
+                        return false;
+
+                    // Check if pushed_to is reachable via river flow
+                    auto dests = river_flow_destinations(board, sx, sy, tx, ty, player, rows, cols, score_cols, true);
+                    for (const auto &d : dests)
+                    {
+                        if (d.first == px && d.second == py)
+                            return true;
+                    }
+                    return false;
+                }
+
+                return false;
+            }
+            else if (m.action == "flip")
+            {
+                // Flipping stone to river requires orientation
+                if (side == STONE)
+                {
+                    return m.orientation == "horizontal" || m.orientation == "vertical";
+                }
+                // Flipping river to stone
+                else if (side == RIVER)
+                {
+                    return true;
                 }
                 return false;
             }
+            else if (m.action == "rotate")
+            {
+                // Can only rotate rivers
+                return side == RIVER;
+            }
 
             return false;
         }
-        else if (m.action == "flip")
-        {
-            // Flipping stone to river requires orientation
-            if (side == STONE)
-            {
-                return m.orientation == "horizontal" || m.orientation == "vertical";
-            }
-            // Flipping river to stone
-            else if (side == RIVER)
-            {
-                return true;
-            }
-            return false;
-        }
-        else if (m.action == "rotate")
-        {
-            // Can only rotate rivers
-            return side == RIVER;
-        }
 
-        return false;
-    }
-
-} // namespace
+    } // namespace
 
 class StudentAgent
 {
@@ -1189,7 +1271,7 @@ public:
         }
 
         // No immediate scoring-increase move found, proceed with MCTS
-        int time_ms = std::min(300, std::max(100, (int)(my_time * 100)));
+        int time_ms = std::min(200, std::max(100, (int)(my_time * 100)));
         Move chosen_move = mcts_search(boardIn, side, rows, cols, score_cols, win_count, std::chrono::milliseconds(time_ms));
         add_to_history(chosen_move);
         return chosen_move;
