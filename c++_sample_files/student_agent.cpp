@@ -11,7 +11,7 @@
 #include <random>
 #include <memory>
 #include <limits>
-#include <queue>
+#include <cstring>
 
 namespace py = pybind11;
 
@@ -26,27 +26,106 @@ struct Move
 
 namespace
 {
+    // Compact board representation: each cell is a uint8_t
+    // bits 0-1: side (0=empty, 1=stone, 2=river)
+    // bit 2: owner (0=circle, 1=square)
+    // bit 3: orientation (0=horizontal, 1=vertical) - only for rivers
+
+    constexpr uint8_t EMPTY = 0;
+    constexpr uint8_t STONE = 1;
+    constexpr uint8_t RIVER = 2;
+    constexpr uint8_t SIDE_MASK = 3;
+    constexpr uint8_t OWNER_CIRCLE = 0;
+    constexpr uint8_t OWNER_SQUARE = 4;
+    constexpr uint8_t OWNER_MASK = 4;
+    constexpr uint8_t ORIENT_HORIZONTAL = 0;
+    constexpr uint8_t ORIENT_VERTICAL = 8;
+    constexpr uint8_t ORIENT_MASK = 8;
+
+    using CompactBoard = std::vector<uint8_t>;
+
     inline int top_score_row() { return 2; }
     inline int bottom_score_row(int rows) { return rows - 3; }
     inline bool in_bounds(int x, int y, int rows, int cols) { return 0 <= x && x < cols && 0 <= y && y < rows; }
 
-    inline bool is_opponent_score_cell(int x, int y, const std::string &player, int rows, int cols, const std::vector<int> &score_cols)
+    // Convert string board to compact representation
+    inline CompactBoard to_compact(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
+                                   int rows, int cols)
     {
-        if (player == "circle")
+        CompactBoard compact(rows * cols, EMPTY);
+        for (int y = 0; y < rows; ++y)
+        {
+            for (int x = 0; x < cols; ++x)
+            {
+                const auto &cell = board[y][x];
+                if (cell.empty())
+                    continue;
+
+                uint8_t val = 0;
+                auto side_it = cell.find("side");
+                if (side_it != cell.end())
+                {
+                    if (side_it->second == "stone")
+                        val |= STONE;
+                    else if (side_it->second == "river")
+                        val |= RIVER;
+                }
+
+                auto owner_it = cell.find("owner");
+                if (owner_it != cell.end() && owner_it->second == "square")
+                    val |= OWNER_SQUARE;
+
+                auto orient_it = cell.find("orientation");
+                if (orient_it != cell.end() && orient_it->second == "vertical")
+                    val |= ORIENT_VERTICAL;
+
+                compact[y * cols + x] = val;
+            }
+        }
+        return compact;
+    }
+
+    // Convert compact board back to string representation
+    inline std::vector<std::vector<std::map<std::string, std::string>>> from_compact(
+        const CompactBoard &compact, int rows, int cols)
+    {
+        std::vector<std::vector<std::map<std::string, std::string>>> board(rows,
+                                                                           std::vector<std::map<std::string, std::string>>(cols));
+
+        for (int y = 0; y < rows; ++y)
+        {
+            for (int x = 0; x < cols; ++x)
+            {
+                uint8_t val = compact[y * cols + x];
+                if (val == EMPTY)
+                    continue;
+
+                auto &cell = board[y][x];
+                uint8_t side = val & SIDE_MASK;
+                if (side == STONE)
+                    cell["side"] = "stone";
+                else if (side == RIVER)
+                    cell["side"] = "river";
+
+                cell["owner"] = (val & OWNER_MASK) ? "square" : "circle";
+
+                if (side == RIVER)
+                    cell["orientation"] = (val & ORIENT_MASK) ? "vertical" : "horizontal";
+            }
+        }
+        return board;
+    }
+
+    inline bool is_opponent_score_cell(int x, int y, uint8_t player, int rows, int cols, const std::vector<int> &score_cols)
+    {
+        if (player == OWNER_CIRCLE)
             return y == bottom_score_row(rows) && std::find(score_cols.begin(), score_cols.end(), x) != score_cols.end();
         return y == top_score_row() && std::find(score_cols.begin(), score_cols.end(), x) != score_cols.end();
     }
 
-    inline bool is_own_score_cell(int x, int y, const std::string &player, int rows, int cols, const std::vector<int> &score_cols)
-    {
-        if (player == "circle")
-            return y == top_score_row() && std::find(score_cols.begin(), score_cols.end(), x) != score_cols.end();
-        return y == bottom_score_row(rows) && std::find(score_cols.begin(), score_cols.end(), x) != score_cols.end();
-    }
-
     inline std::vector<std::pair<int, int>> river_flow_destinations(
-        const std::vector<std::vector<std::map<std::string, std::string>>> &board,
-        int rx, int ry, int sx, int sy, const std::string &player,
+        const CompactBoard &board,
+        int rx, int ry, int sx, int sy, uint8_t player,
         int rows, int cols, const std::vector<int> &score_cols, bool river_push)
     {
         std::vector<std::pair<int, int>> dest;
@@ -54,12 +133,11 @@ namespace
         std::vector<std::pair<int, int>> q{{rx, ry}};
         size_t qi = 0;
 
-        auto cell_at = [&](int x, int y) -> const std::map<std::string, std::string> *
+        auto cell_at = [&](int x, int y) -> uint8_t
         {
             if (!in_bounds(x, y, rows, cols))
-                return nullptr;
-            const auto &m = board[y][x];
-            return m.empty() ? nullptr : &m;
+                return EMPTY;
+            return board[y * cols + x];
         };
 
         while (qi < q.size())
@@ -72,18 +150,19 @@ namespace
                 continue;
             visited[id] = 1;
 
-            const std::map<std::string, std::string> *cell = (river_push && x == rx && y == ry) ? cell_at(sx, sy) : cell_at(x, y);
-            if (!cell)
+            uint8_t cell = (river_push && x == rx && y == ry) ? cell_at(sx, sy) : cell_at(x, y);
+            if (cell == EMPTY)
             {
                 if (!is_opponent_score_cell(x, y, player, rows, cols, score_cols))
                     dest.emplace_back(x, y);
                 continue;
             }
-            auto itSide = cell->find("side");
-            if (itSide == cell->end() || itSide->second != "river")
+
+            uint8_t side = cell & SIDE_MASK;
+            if (side != RIVER)
                 continue;
 
-            bool horiz = cell->at("orientation") == "horizontal";
+            bool horiz = !(cell & ORIENT_MASK);
             std::array<std::pair<int, int>, 2> dirs = horiz ? std::array<std::pair<int, int>, 2>{{{1, 0}, {-1, 0}}}
                                                             : std::array<std::pair<int, int>, 2>{{{0, 1}, {0, -1}}};
             for (auto [dx, dy] : dirs)
@@ -93,8 +172,7 @@ namespace
                 {
                     if (is_opponent_score_cell(nx, ny, player, rows, cols, score_cols))
                         break;
-                    const auto &nc = board[ny][nx];
-                    if (!nc.empty())
+                    if (board[ny * cols + nx] != EMPTY)
                         break;
                     q.emplace_back(nx, ny);
                     nx += dx;
@@ -124,19 +202,21 @@ namespace
         std::vector<std::pair<std::pair<int, int>, std::pair<int, int>>> pushes;
     };
 
-    inline Targets compute_valid_targets(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
-                                         int sx, int sy, const std::string &player,
+    inline Targets compute_valid_targets(const CompactBoard &board,
+                                         int sx, int sy, uint8_t player,
                                          int rows, int cols, const std::vector<int> &score_cols)
     {
         Targets t;
         if (!in_bounds(sx, sy, rows, cols))
             return t;
-        const auto &cell = board[sy][sx];
-        if (cell.empty() || cell.at("owner") != player)
+
+        uint8_t cell = board[sy * cols + sx];
+        if (cell == EMPTY || (cell & OWNER_MASK) != player)
             return t;
 
-        bool isStone = cell.at("side") == "stone";
+        bool isStone = (cell & SIDE_MASK) == STONE;
         std::array<std::pair<int, int>, 4> dirs{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
+
         for (auto [dx, dy] : dirs)
         {
             int tx = sx + dx, ty = sy + dy;
@@ -144,14 +224,16 @@ namespace
                 continue;
             if (is_opponent_score_cell(tx, ty, player, rows, cols, score_cols))
                 continue;
-            const auto &target = board[ty][tx];
-            if (target.empty())
+
+            uint8_t target = board[ty * cols + tx];
+            if (target == EMPTY)
             {
                 t.moves.emplace_back(tx, ty);
             }
             else
             {
-                if (target.at("side") == "river")
+                uint8_t target_side = target & SIDE_MASK;
+                if (target_side == RIVER)
                 {
                     auto dests = river_flow_destinations(board, tx, ty, sx, sy, player, rows, cols, score_cols, false);
                     for (auto &d : dests)
@@ -162,7 +244,7 @@ namespace
                     if (isStone)
                     {
                         int px = tx + dx, py = ty + dy;
-                        if (in_bounds(px, py, rows, cols) && !is_opponent_score_cell(px, py, player, rows, cols, score_cols) && board[py][px].empty())
+                        if (in_bounds(px, py, rows, cols) && !is_opponent_score_cell(px, py, player, rows, cols, score_cols) && board[py * cols + px] == EMPTY)
                             t.pushes.emplace_back(std::make_pair(tx, ty), std::make_pair(px, py));
                     }
                     else
@@ -191,309 +273,131 @@ namespace
         return t;
     }
 
-    static void apply_move(std::vector<std::vector<std::map<std::string, std::string>>> &b, const Move &m)
+    static void apply_move(CompactBoard &b, const Move &m, int rows, int cols)
     {
-        auto &from = b[m.from[1]][m.from[0]];
+        int from_idx = m.from[1] * cols + m.from[0];
+        uint8_t &from_cell = b[from_idx];
+
         if (m.action == "move")
         {
-            auto piece = from;
-            from.clear();
-            b[m.to[1]][m.to[0]] = piece;
+            int to_idx = m.to[1] * cols + m.to[0];
+            b[to_idx] = from_cell;
+            from_cell = EMPTY;
         }
         else if (m.action == "push")
         {
-            bool pusher_river = (!from.empty() && from.at("side") == "river");
+            bool pusher_river = (from_cell & SIDE_MASK) == RIVER;
             if (pusher_river)
             {
-                from["side"] = "stone";
-                from.erase("orientation");
+                from_cell = (from_cell & OWNER_MASK) | STONE;
             }
-            auto pushed = b[m.to[1]][m.to[0]];
-            b[m.to[1]][m.to[0]].clear();
-            b[m.pushed_to[1]][m.pushed_to[0]] = pushed;
+            int to_idx = m.to[1] * cols + m.to[0];
+            int pushed_idx = m.pushed_to[1] * cols + m.pushed_to[0];
+            b[pushed_idx] = b[to_idx];
+            b[to_idx] = EMPTY;
         }
         else if (m.action == "flip")
         {
-            if (from.at("side") == "stone")
+            if ((from_cell & SIDE_MASK) == STONE)
             {
-                from["side"] = "river";
-                from["orientation"] = m.orientation;
+                uint8_t owner = from_cell & OWNER_MASK;
+                uint8_t orient = (m.orientation == "vertical") ? ORIENT_VERTICAL : ORIENT_HORIZONTAL;
+                from_cell = RIVER | owner | orient;
             }
             else
             {
-                from["side"] = "stone";
-                from.erase("orientation");
+                from_cell = (from_cell & OWNER_MASK) | STONE;
             }
         }
         else if (m.action == "rotate")
         {
-            from["orientation"] = (from.at("orientation") == "horizontal") ? "vertical" : "horizontal";
+            from_cell ^= ORIENT_MASK;
         }
     }
 
-    inline int stones_in_SA(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
-                            const std::string &me, int rows, int cols, const std::vector<int> &score_cols)
+    inline int stones_in_SA(const CompactBoard &board, uint8_t player,
+                            int rows, int cols, const std::vector<int> &score_cols)
     {
-        int row = (me == "circle") ? top_score_row() : bottom_score_row(rows);
+        int row = (player == OWNER_CIRCLE) ? top_score_row() : bottom_score_row(rows);
         int cnt = 0;
         for (int x : score_cols)
         {
-            const auto &c = board[row][x];
-            if (!c.empty() && c.at("owner") == me && c.at("side") == "stone")
+            uint8_t c = board[row * cols + x];
+            if (c != EMPTY && (c & OWNER_MASK) == player && (c & SIDE_MASK) == STONE)
                 ++cnt;
         }
         return cnt;
     }
 
-    // BFS to find shortest path distance to scoring area
-    inline int bfs_distance_to_SA(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
-                                  int sx, int sy, const std::string &player,
-                                  int rows, int cols, const std::vector<int> &score_cols)
+    inline double evaluate_position(const CompactBoard &board, uint8_t root,
+                                    int rows, int cols, const std::vector<int> &score_cols, int win_count)
     {
-        std::vector<std::vector<int>> dist(rows, std::vector<int>(cols, -1));
-        std::queue<std::pair<int, int>> q;
-        q.push({sx, sy});
-        dist[sy][sx] = 0;
+        uint8_t opp = (root == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
 
-        while (!q.empty())
+        auto targetRowMe = (root == OWNER_CIRCLE) ? top_score_row() : bottom_score_row(rows);
+        auto targetRowOpp = (root == OWNER_CIRCLE) ? bottom_score_row(rows) : top_score_row();
+
+        auto nearest_dx = [&](int x)
         {
-            auto [x, y] = q.front();
-            q.pop();
+            int best = 1e9;
+            for (int c : score_cols)
+                best = std::min(best, std::abs(x - c));
+            return best;
+        };
 
-            // Check if we reached scoring area
-            if (is_own_score_cell(x, y, player, rows, cols, score_cols))
-                return dist[y][x];
-
-            // Try all adjacent cells and river flows
-            std::array<std::pair<int, int>, 4> dirs{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
-            for (auto [dx, dy] : dirs)
-            {
-                int nx = x + dx, ny = y + dy;
-                if (!in_bounds(nx, ny, rows, cols) || dist[ny][nx] != -1)
-                    continue;
-                if (is_opponent_score_cell(nx, ny, player, rows, cols, score_cols))
-                    continue;
-
-                const auto &cell = board[ny][nx];
-                if (cell.empty())
-                {
-                    dist[ny][nx] = dist[y][x] + 1;
-                    q.push({nx, ny});
-                }
-                else if (cell.at("side") == "river")
-                {
-                    // Can use river flow
-                    auto dests = river_flow_destinations(board, nx, ny, x, y, player, rows, cols, score_cols, false);
-                    for (auto [rx, ry] : dests)
-                    {
-                        if (dist[ry][rx] == -1)
-                        {
-                            dist[ry][rx] = dist[y][x] + 1;
-                            q.push({rx, ry});
-                        }
-                    }
-                }
-            }
-        }
-        return 1000; // No path found
-    }
-
-    // Check if a river at (x, y) with given orientation creates a useful path
-    inline double evaluate_river_placement(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
-                                           int x, int y, const std::string &orientation, const std::string &player,
-                                           int rows, int cols, const std::vector<int> &score_cols)
-    {
-        double score = 0.0;
-
-        // Create temporary board with this river
-        auto test_board = board;
-        test_board[y][x]["side"] = "river";
-        test_board[y][x]["orientation"] = orientation;
-        test_board[y][x]["owner"] = player;
-
-        // Check how many of our stones can now reach SA faster
-        int improvement_count = 0;
-        double total_improvement = 0.0;
-
-        for (int py = 0; py < rows; ++py)
-        {
-            for (int px = 0; px < cols; ++px)
-            {
-                const auto &cell = board[py][px];
-                if (cell.empty() || cell.at("owner") != player || cell.at("side") != "stone")
-                    continue;
-
-                int old_dist = bfs_distance_to_SA(board, px, py, player, rows, cols, score_cols);
-                int new_dist = bfs_distance_to_SA(test_board, px, py, player, rows, cols, score_cols);
-
-                if (new_dist < old_dist)
-                {
-                    improvement_count++;
-                    total_improvement += (old_dist - new_dist);
-                }
-            }
-        }
-
-        // Bonus for creating river networks (rivers that connect)
-        int connected_rivers = 0;
-        std::array<std::pair<int, int>, 4> dirs{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
-        for (auto [dx, dy] : dirs)
-        {
-            int nx = x + dx, ny = y + dy;
-            if (!in_bounds(nx, ny, rows, cols))
-                continue;
-            const auto &neighbor = board[ny][nx];
-            if (!neighbor.empty() && neighbor.at("owner") == player && neighbor.at("side") == "river")
-                connected_rivers++;
-        }
-
-        // Bonus for rivers that point toward scoring area
-        int target_row = (player == "circle") ? top_score_row() : bottom_score_row(rows);
-        bool points_toward_sa = false;
-        if (orientation == "vertical")
-        {
-            points_toward_sa = true; // Vertical rivers always help movement toward SA
-        }
-        else // horizontal
-        {
-            // Horizontal rivers help if we're in a scoring column or adjacent
-            for (int sc : score_cols)
-            {
-                if (std::abs(x - sc) <= 2)
-                {
-                    points_toward_sa = true;
-                    break;
-                }
-            }
-        }
-
-        score += improvement_count * 2.0;
-        score += total_improvement * 0.5;
-        score += connected_rivers * 1.5;
-        score += points_toward_sa ? 1.0 : 0.0;
-
-        // Bonus for rivers closer to scoring area
-        int dist_to_sa = std::abs(y - target_row);
-        score += (rows - dist_to_sa) * 0.1;
-
-        return score;
-    }
-
-    inline double evaluate_position(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
-                                    const std::string &root, int rows, int cols, const std::vector<int> &score_cols, int win_count)
-    {
-        std::string opp = (root == "circle") ? "square" : "circle";
-        int mySA = stones_in_SA(board, root, rows, cols, score_cols);
-        int opSA = stones_in_SA(board, opp, rows, cols, score_cols);
-
-        if (mySA >= win_count)
-            return 1.0;
-        if (opSA >= win_count)
-            return 0.0;
-
-        double score = 0.5;
-
-        // Scoring area advantage (highest priority)
-        score += (mySA - opSA) * 0.1;
-
-        // Count stones with fast paths to SA via rivers
-        int my_reachable = 0, opp_reachable = 0;
+        double myScore = 0.0, oppScore = 0.0;
         for (int y = 0; y < rows; ++y)
         {
             for (int x = 0; x < cols; ++x)
             {
-                const auto &c = board[y][x];
-                if (c.empty() || c.at("side") != "stone")
+                uint8_t c = board[y * cols + x];
+                if (c == EMPTY || (c & SIDE_MASK) != STONE)
                     continue;
 
-                if (c.at("owner") == root)
+                if ((c & OWNER_MASK) == root)
                 {
-                    int dist = bfs_distance_to_SA(board, x, y, root, rows, cols, score_cols);
-                    if (dist <= 3) // Reachable in 3 moves or less
-                        my_reachable++;
-                    score += 0.01 / (1.0 + dist); // Proximity bonus
+                    int dy = std::abs(y - targetRowMe);
+                    int dx = nearest_dx(x);
+                    double dist = dy + dx;
+                    myScore += std::exp(-dist * 0.3);
                 }
                 else
                 {
-                    int dist = bfs_distance_to_SA(board, x, y, opp, rows, cols, score_cols);
-                    if (dist <= 3)
-                        opp_reachable++;
-                    score -= 0.01 / (1.0 + dist);
+                    int dy = std::abs(y - targetRowOpp);
+                    int dx = nearest_dx(x);
+                    double dist = dy + dx;
+                    oppScore += std::exp(-dist * 0.3);
                 }
             }
         }
 
-        score += (my_reachable - opp_reachable) * 0.05;
+        double total = myScore + oppScore;
+        if (total < 1e-9)
+            return 0.5;
 
-        // River network evaluation
-        int my_rivers = 0, my_strategic_rivers = 0;
-        int opp_rivers = 0;
-
-        for (int y = 0; y < rows; ++y)
-        {
-            for (int x = 0; x < cols; ++x)
-            {
-                const auto &c = board[y][x];
-                if (c.empty() || c.at("side") != "river")
-                    continue;
-
-                if (c.at("owner") == root)
-                {
-                    my_rivers++;
-                    // Check if this river creates a strategic path
-                    double river_value = evaluate_river_placement(board, x, y, c.at("orientation"), root, rows, cols, score_cols);
-                    if (river_value > 2.0)
-                        my_strategic_rivers++;
-                    score += river_value * 0.005;
-                }
-                else
-                {
-                    opp_rivers++;
-                }
-            }
-        }
-
-        // Bonus for maintaining rivers while having stones
-        int my_stones = 0;
-        for (int y = 0; y < rows; ++y)
-        {
-            for (int x = 0; x < cols; ++x)
-            {
-                const auto &c = board[y][x];
-                if (!c.empty() && c.at("owner") == root && c.at("side") == "stone")
-                    my_stones++;
-            }
-        }
-
-        // Encourage having rivers when you have stones to move
-        if (my_stones > 0 && my_rivers > 0)
-            score += std::min(my_rivers, my_stones / 2) * 0.02;
-
-        return std::max(0.0, std::min(1.0, score));
+        return myScore / total;
     }
 
-    // MCTS Node
     struct MCTSNode
     {
-        std::vector<std::vector<std::map<std::string, std::string>>> board;
+        CompactBoard board;
         Move move;
         MCTSNode *parent;
         std::vector<std::unique_ptr<MCTSNode>> children;
         int visits;
         double wins;
         bool is_fully_expanded;
-        std::string player_to_move;
+        uint8_t player_to_move;
         std::vector<Move> untried_moves;
 
-        MCTSNode(const std::vector<std::vector<std::map<std::string, std::string>>> &b,
-                 const Move &m, MCTSNode *p, const std::string &player)
+        MCTSNode(const CompactBoard &b, const Move &m, MCTSNode *p, uint8_t player)
             : board(b), move(m), parent(p), visits(0), wins(0.0),
               is_fully_expanded(false), player_to_move(player) {}
 
         bool is_terminal(int rows, int cols, const std::vector<int> &score_cols, int win_count) const
         {
-            int circleSA = stones_in_SA(board, "circle", rows, cols, score_cols);
-            int squareSA = stones_in_SA(board, "square", rows, cols, score_cols);
+            int circleSA = stones_in_SA(board, OWNER_CIRCLE, rows, cols, score_cols);
+            int squareSA = stones_in_SA(board, OWNER_SQUARE, rows, cols, score_cols);
             return circleSA >= win_count || squareSA >= win_count;
         }
 
@@ -521,17 +425,18 @@ namespace
         }
     };
 
-    std::vector<Move> generate_all_moves_internal(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
-                                                  const std::string &player, int rows, int cols, const std::vector<int> &score_cols)
+    std::vector<Move> generate_all_moves_internal(const CompactBoard &board, uint8_t player,
+                                                  int rows, int cols, const std::vector<int> &score_cols)
     {
         std::vector<Move> out;
         out.reserve(512);
+
         for (int y = 0; y < rows; ++y)
         {
             for (int x = 0; x < cols; ++x)
             {
-                const auto &cell = board[y][x];
-                if (cell.empty() || cell.at("owner") != player)
+                uint8_t cell = board[y * cols + x];
+                if (cell == EMPTY || (cell & OWNER_MASK) != player)
                     continue;
 
                 Targets tg = compute_valid_targets(board, x, y, player, rows, cols, score_cols);
@@ -553,9 +458,8 @@ namespace
                     out.push_back(m);
                 }
 
-                if (cell.at("side") == "stone")
+                if ((cell & SIDE_MASK) == STONE)
                 {
-                    // Prioritize strategic river placements
                     for (auto ori : {"horizontal", "vertical"})
                     {
                         Move m;
@@ -594,51 +498,9 @@ namespace
             }
         }
 
-        // Prioritize strategic moves during expansion
         static std::mt19937 rng(std::random_device{}());
-
-        // Separate moves by type and evaluate flips
-        std::vector<size_t> strategic_flips;
-        std::vector<size_t> other_moves;
-
-        for (size_t i = 0; i < node->untried_moves.size(); ++i)
-        {
-            const auto &move = node->untried_moves[i];
-            if (move.action == "flip" && !move.orientation.empty())
-            {
-                // Evaluate this river placement
-                double value = evaluate_river_placement(node->board, move.from[0], move.from[1],
-                                                        move.orientation, node->player_to_move,
-                                                        rows, cols, score_cols);
-                if (value > 2.0) // Strategic threshold
-                    strategic_flips.push_back(i);
-                else
-                    other_moves.push_back(i);
-            }
-            else
-            {
-                other_moves.push_back(i);
-            }
-        }
-
-        // Prefer strategic flips 40% of the time
-        size_t idx;
-        if (!strategic_flips.empty() && (other_moves.empty() || std::uniform_real_distribution<>(0, 1)(rng) < 0.4))
-        {
-            std::uniform_int_distribution<size_t> dist(0, strategic_flips.size() - 1);
-            idx = strategic_flips[dist(rng)];
-        }
-        else if (!other_moves.empty())
-        {
-            std::uniform_int_distribution<size_t> dist(0, other_moves.size() - 1);
-            idx = other_moves[dist(rng)];
-        }
-        else
-        {
-            std::uniform_int_distribution<size_t> dist(0, node->untried_moves.size() - 1);
-            idx = dist(rng);
-        }
-
+        std::uniform_int_distribution<size_t> dist(0, node->untried_moves.size() - 1);
+        size_t idx = dist(rng);
         Move move = node->untried_moves[idx];
         node->untried_moves.erase(node->untried_moves.begin() + idx);
 
@@ -646,9 +508,9 @@ namespace
             node->is_fully_expanded = true;
 
         auto new_board = node->board;
-        apply_move(new_board, move);
+        apply_move(new_board, move, rows, cols);
 
-        std::string next_player = (node->player_to_move == "circle") ? "square" : "circle";
+        uint8_t next_player = (node->player_to_move == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
         auto child = std::make_unique<MCTSNode>(new_board, move, node, next_player);
         MCTSNode *child_ptr = child.get();
         node->children.push_back(std::move(child));
@@ -656,69 +518,32 @@ namespace
         return child_ptr;
     }
 
-    double simulate(const std::vector<std::vector<std::map<std::string, std::string>>> &start_board,
-                    std::string current_player, const std::string &root_player,
+    double simulate(const CompactBoard &start_board, uint8_t current_player, uint8_t root_player,
                     int rows, int cols, const std::vector<int> &score_cols, int win_count,
-                    int max_depth = 30)
+                    int max_depth = 20)
     {
         auto board = start_board;
         static std::mt19937 rng(std::random_device{}());
 
         for (int depth = 0; depth < max_depth; ++depth)
         {
-            int circleSA = stones_in_SA(board, "circle", rows, cols, score_cols);
-            int squareSA = stones_in_SA(board, "square", rows, cols, score_cols);
+            int circleSA = stones_in_SA(board, OWNER_CIRCLE, rows, cols, score_cols);
+            int squareSA = stones_in_SA(board, OWNER_SQUARE, rows, cols, score_cols);
 
             if (circleSA >= win_count)
-                return (root_player == "circle") ? 1.0 : 0.0;
+                return (root_player == OWNER_CIRCLE) ? 1.0 : 0.0;
             if (squareSA >= win_count)
-                return (root_player == "square") ? 1.0 : 0.0;
+                return (root_player == OWNER_SQUARE) ? 1.0 : 0.0;
 
             auto moves = generate_all_moves_internal(board, current_player, rows, cols, score_cols);
             if (moves.empty())
                 break;
 
-            // Biased random selection favoring strategic moves
-            Move selected_move;
-            std::vector<Move> strategic_moves;
-            for (const auto &move : moves)
-            {
-                if (move.action == "move" || move.action == "push")
-                {
-                    // Check if move gets closer to SA
-                    int dist_before = bfs_distance_to_SA(board, move.from[0], move.from[1], current_player, rows, cols, score_cols);
-                    auto test_board = board;
-                    apply_move(test_board, move);
-                    int tx = (move.action == "move") ? move.to[0] : move.from[0];
-                    int ty = (move.action == "move") ? move.to[1] : move.from[1];
-                    int dist_after = bfs_distance_to_SA(test_board, tx, ty, current_player, rows, cols, score_cols);
+            std::uniform_int_distribution<size_t> dist(0, moves.size() - 1);
+            Move move = moves[dist(rng)];
+            apply_move(board, move, rows, cols);
 
-                    if (dist_after < dist_before)
-                        strategic_moves.push_back(move);
-                }
-                else if (move.action == "flip" && !move.orientation.empty())
-                {
-                    double value = evaluate_river_placement(board, move.from[0], move.from[1],
-                                                            move.orientation, current_player,
-                                                            rows, cols, score_cols);
-                    if (value > 2.0)
-                        strategic_moves.push_back(move);
-                }
-            }
-
-            if (!strategic_moves.empty() && std::uniform_real_distribution<>(0, 1)(rng) < 0.6)
-            {
-                std::uniform_int_distribution<size_t> dist(0, strategic_moves.size() - 1);
-                selected_move = strategic_moves[dist(rng)];
-            }
-            else
-            {
-                std::uniform_int_distribution<size_t> dist(0, moves.size() - 1);
-                selected_move = moves[dist(rng)];
-            }
-
-            apply_move(board, selected_move);
-            current_player = (current_player == "circle") ? "square" : "circle";
+            current_player = (current_player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
         }
 
         return evaluate_position(board, root_player, rows, cols, score_cols, win_count);
@@ -735,10 +560,14 @@ namespace
         }
     }
 
-    Move mcts_search(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
-                     const std::string &player, int rows, int cols, const std::vector<int> &score_cols,
+    Move mcts_search(const std::vector<std::vector<std::map<std::string, std::string>>> &board_str,
+                     const std::string &player_str, int rows, int cols, const std::vector<int> &score_cols,
                      int win_count, std::chrono::milliseconds time_limit)
     {
+        // Convert to compact representation
+        CompactBoard board = to_compact(board_str, rows, cols);
+        uint8_t player = (player_str == "circle") ? OWNER_CIRCLE : OWNER_SQUARE;
+
         auto deadline = std::chrono::steady_clock::now() + time_limit;
 
         Move dummy;
@@ -768,6 +597,7 @@ namespace
             }
 
             double result = simulate(node->board, node->player_to_move, player, rows, cols, score_cols, win_count);
+
             backpropagate(node, result);
 
             iterations++;
@@ -800,12 +630,25 @@ namespace
 class StudentAgent
 {
 public:
-    explicit StudentAgent(std::string side) : side(std::move(side)) {}
+    explicit StudentAgent(std::string side, int history_size = 3)
+        : side(std::move(side)), max_history_size(history_size) {}
 
     std::vector<Move> generate_all_moves(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
                                          int rows, int cols, const std::vector<int> &score_cols) const
     {
-        return generate_all_moves_internal(board, side, rows, cols, score_cols);
+        CompactBoard compact = to_compact(board, rows, cols);
+        uint8_t player = (side == "circle") ? OWNER_CIRCLE : OWNER_SQUARE;
+        auto moves = generate_all_moves_internal(compact, player, rows, cols, score_cols);
+
+        std::vector<Move> filtered;
+        filtered.reserve(moves.size());
+        for (const auto &m : moves)
+        {
+            if (!is_in_history(m))
+                filtered.push_back(m);
+        }
+
+        return filtered.empty() ? moves : filtered;
     }
 
     Move choose(const std::vector<std::vector<std::map<std::string, std::string>>> &boardIn,
@@ -813,13 +656,48 @@ public:
                 float my_time, float /*opp_time*/)
     {
         int win_count = (int)score_cols.size();
-        int time_ms = std::min(2000, std::max(100, (int)(my_time * 100)));
 
-        return mcts_search(boardIn, side, rows, cols, score_cols, win_count, std::chrono::milliseconds(time_ms));
+        int time_ms = std::min(400, std::max(100, (int)(my_time * 100)));
+
+        Move chosen_move = mcts_search(boardIn, side, rows, cols, score_cols, win_count, std::chrono::milliseconds(time_ms));
+
+        add_to_history(chosen_move);
+
+        return chosen_move;
     }
 
 private:
     std::string side;
+    int max_history_size;
+    std::vector<Move> move_history;
+
+    bool moves_equal(const Move &a, const Move &b) const
+    {
+        return a.action == b.action &&
+               a.from == b.from &&
+               a.to == b.to &&
+               a.pushed_to == b.pushed_to &&
+               a.orientation == b.orientation;
+    }
+
+    bool is_in_history(const Move &m) const
+    {
+        for (const auto &hist_move : move_history)
+        {
+            if (moves_equal(m, hist_move))
+                return true;
+        }
+        return false;
+    }
+
+    void add_to_history(const Move &m)
+    {
+        move_history.push_back(m);
+        if ((int)move_history.size() > max_history_size)
+        {
+            move_history.erase(move_history.begin());
+        }
+    }
 };
 
 PYBIND11_MODULE(student_agent_module, m)
@@ -833,6 +711,7 @@ PYBIND11_MODULE(student_agent_module, m)
 
     py::class_<StudentAgent>(m, "StudentAgent")
         .def(py::init<std::string>())
+        .def(py::init<std::string, int>(), py::arg("side"), py::arg("history_size") = 3)
         .def("generate_all_moves", &StudentAgent::generate_all_moves)
         .def("choose", &StudentAgent::choose);
 }
