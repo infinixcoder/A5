@@ -143,18 +143,29 @@ namespace
         while (qi < q.size())
         {
             auto [x, y] = q[qi++];
+
+            // Check visited and bounds BEFORE accessing
             if (!in_bounds(x, y, rows, cols))
                 continue;
             int id = y * cols + x;
             if (visited[id])
                 continue;
+
             visited[id] = 1;
 
+            // Determine which cell to check
             uint8_t cell = (river_push && x == rx && y == ry) ? cell_at(sx, sy) : cell_at(x, y);
+
             if (cell == EMPTY)
             {
-                if (!is_opponent_score_cell(x, y, player, rows, cols, score_cols))
+                if (is_opponent_score_cell(x, y, player, rows, cols, score_cols))
+                {
+                    // Block entering opponent score - do nothing (don't add to destinations)
+                }
+                else
+                {
                     dest.emplace_back(x, y);
+                }
                 continue;
             }
 
@@ -165,6 +176,7 @@ namespace
             bool horiz = !(cell & ORIENT_MASK);
             std::array<std::pair<int, int>, 2> dirs = horiz ? std::array<std::pair<int, int>, 2>{{{1, 0}, {-1, 0}}}
                                                             : std::array<std::pair<int, int>, 2>{{{0, 1}, {0, -1}}};
+
             for (auto [dx, dy] : dirs)
             {
                 int nx = x + dx, ny = y + dy;
@@ -172,15 +184,37 @@ namespace
                 {
                     if (is_opponent_score_cell(nx, ny, player, rows, cols, score_cols))
                         break;
-                    if (board[ny * cols + nx] != EMPTY)
+
+                    uint8_t next_cell = board[ny * cols + nx];
+
+                    if (next_cell == EMPTY)
+                    {
+                        dest.emplace_back(nx, ny);
+                        nx += dx;
+                        ny += dy;
+                        continue;
+                    }
+
+                    // Skip the source cell (sx, sy)
+                    if (nx == sx && ny == sy)
+                    {
+                        nx += dx;
+                        ny += dy;
+                        continue;
+                    }
+
+                    if ((next_cell & SIDE_MASK) == RIVER)
+                    {
+                        q.emplace_back(nx, ny);
                         break;
-                    q.emplace_back(nx, ny);
-                    nx += dx;
-                    ny += dy;
+                    }
+
+                    break;
                 }
             }
         }
 
+        // Remove duplicates
         std::vector<uint8_t> seen(rows * cols, 0);
         std::vector<std::pair<int, int>> out;
         out.reserve(dest.size());
@@ -318,8 +352,13 @@ namespace
             }
             int to_idx = m.to[1] * cols + m.to[0];
             int pushed_idx = m.pushed_to[1] * cols + m.pushed_to[0];
+
+            // Move the pushed piece to its destination
             b[pushed_idx] = b[to_idx];
-            b[to_idx] = EMPTY;
+
+            // Move the pusher to the vacated cell
+            b[to_idx] = from_cell;
+            from_cell = EMPTY;
         }
         else if (m.action == "flip")
         {
