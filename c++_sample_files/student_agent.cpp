@@ -244,8 +244,31 @@ namespace
                     if (isStone)
                     {
                         int px = tx + dx, py = ty + dy;
-                        if (in_bounds(px, py, rows, cols) && !is_opponent_score_cell(px, py, player, rows, cols, score_cols) && board[py * cols + px] == EMPTY)
-                            t.pushes.emplace_back(std::make_pair(tx, ty), std::make_pair(px, py));
+                        if (!in_bounds(px, py, rows, cols))
+                            continue;
+                        if (board[py * cols + px] != EMPTY)
+                            continue;
+
+                        // Check ownership of the pushed piece
+                        uint8_t pushed_owner = target & OWNER_MASK;
+
+                        // If pushing our own piece, can't push into opponent's scoring area
+                        // If pushing opponent's piece, can't push into our scoring area
+                        if (pushed_owner == player)
+                        {
+                            // Pushing our own piece - check opponent's scoring area
+                            if (is_opponent_score_cell(px, py, player, rows, cols, score_cols))
+                                continue;
+                        }
+                        else
+                        {
+                            // Pushing opponent's piece - check our scoring area
+                            uint8_t opponent = (player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
+                            if (is_opponent_score_cell(px, py, opponent, rows, cols, score_cols))
+                                continue;
+                        }
+
+                        t.pushes.emplace_back(std::make_pair(tx, ty), std::make_pair(px, py));
                     }
                     else
                     {
@@ -486,7 +509,7 @@ namespace
         return out;
     }
 
-    MCTSNode *expand(MCTSNode *node, int rows, int cols, const std::vector<int> &score_cols)
+    MCTSNode *expand(MCTSNode *node, int rows, int cols, const std::vector<int> &score_cols, int win_count)
     {
         if (node->untried_moves.empty())
         {
@@ -496,13 +519,25 @@ namespace
                 node->is_fully_expanded = true;
                 return node;
             }
+
+            // Sort moves by heuristic evaluation (best first)
+            std::sort(node->untried_moves.begin(), node->untried_moves.end(),
+                      [&](const Move &a, const Move &b)
+                      {
+                          CompactBoard board_a = node->board, board_b = node->board;
+                          apply_move(board_a, a, rows, cols);
+                          apply_move(board_b, b, rows, cols);
+
+                          double eval_a = evaluate_position(board_a, node->player_to_move, rows, cols, score_cols, win_count);
+                          double eval_b = evaluate_position(board_b, node->player_to_move, rows, cols, score_cols, win_count);
+
+                          return eval_a > eval_b;
+                      });
         }
 
-        static std::mt19937 rng(std::random_device{}());
-        std::uniform_int_distribution<size_t> dist(0, node->untried_moves.size() - 1);
-        size_t idx = dist(rng);
-        Move move = node->untried_moves[idx];
-        node->untried_moves.erase(node->untried_moves.begin() + idx);
+        // Take the best untried move (front of sorted list)
+        Move move = node->untried_moves.front();
+        node->untried_moves.erase(node->untried_moves.begin());
 
         if (node->untried_moves.empty())
             node->is_fully_expanded = true;
@@ -519,16 +554,28 @@ namespace
     }
 
     double simulate(const CompactBoard &start_board, uint8_t current_player, uint8_t root_player,
-                    int rows, int cols, const std::vector<int> &score_cols, int win_count,
-                    int max_depth = 20)
+                    int rows, int cols, const std::vector<int> &score_cols, int win_count)
     {
         auto board = start_board;
         static std::mt19937 rng(std::random_device{}());
 
+        // Adaptive depth based on how close we are to winning
+        int circleSA = stones_in_SA(start_board, OWNER_CIRCLE, rows, cols, score_cols);
+        int squareSA = stones_in_SA(start_board, OWNER_SQUARE, rows, cols, score_cols);
+
+        int max_stones = std::max(circleSA, squareSA);
+        int stones_needed = win_count - max_stones;
+
+        // More depth if we're far from winning, less if close
+        //int max_depth = stones_needed > 3 ? 30 : 15;
+        int max_depth = stones_needed > 3 ? 3 : 3;
+
+        double prev_eval = evaluate_position(board, root_player, rows, cols, score_cols, win_count);
+
         for (int depth = 0; depth < max_depth; ++depth)
         {
-            int circleSA = stones_in_SA(board, OWNER_CIRCLE, rows, cols, score_cols);
-            int squareSA = stones_in_SA(board, OWNER_SQUARE, rows, cols, score_cols);
+            circleSA = stones_in_SA(board, OWNER_CIRCLE, rows, cols, score_cols);
+            squareSA = stones_in_SA(board, OWNER_SQUARE, rows, cols, score_cols);
 
             if (circleSA >= win_count)
                 return (root_player == OWNER_CIRCLE) ? 1.0 : 0.0;
@@ -539,11 +586,57 @@ namespace
             if (moves.empty())
                 break;
 
-            std::uniform_int_distribution<size_t> dist(0, moves.size() - 1);
-            Move move = moves[dist(rng)];
-            apply_move(board, move, rows, cols);
+            // Epsilon-greedy strategy (80% greedy, 20% random)
+            Move move;
+            std::uniform_real_distribution<double> epsilon_dist(0.0, 1.0);
 
+            if (epsilon_dist(rng) < 1.0 && moves.size() > 1)
+            {
+                // Greedy: pick best move according to heuristic
+                double best_eval = -1.0;
+                size_t best_idx = 0;
+
+                // Check top 10 moves to balance speed and quality
+                size_t check_count = std::min(moves.size(), size_t(10));
+                for (size_t i = 0; i < check_count; ++i)
+                {
+                    CompactBoard temp = board;
+                    apply_move(temp, moves[i], rows, cols);
+                    double eval = evaluate_position(temp, current_player, rows, cols, score_cols, win_count);
+
+                    if (eval > best_eval)
+                    {
+                        best_eval = eval;
+                        best_idx = i;
+                    }
+                }
+                move = moves[best_idx];
+            }
+            else
+            {
+                // Random exploration
+                std::uniform_int_distribution<size_t> dist(0, moves.size() - 1);
+                move = moves[dist(rng)];
+            }
+
+            apply_move(board, move, rows, cols);
             current_player = (current_player == OWNER_CIRCLE) ? OWNER_SQUARE : OWNER_CIRCLE;
+
+            // Early termination based on evaluation
+            if (depth % 5 == 0 && depth > 0)
+            {
+                double curr_eval = evaluate_position(board, root_player, rows, cols, score_cols, win_count);
+
+                // If evaluation is extreme (very good or very bad), stop early
+                if (curr_eval > 0.95 || curr_eval < 0.05)
+                    return curr_eval;
+
+                // If evaluation hasn't changed much, the position is stable
+                if (std::abs(curr_eval - prev_eval) < 0.05)
+                    return curr_eval;
+
+                prev_eval = curr_eval;
+            }
         }
 
         return evaluate_position(board, root_player, rows, cols, score_cols, win_count);
@@ -593,7 +686,7 @@ namespace
 
             if (!node->is_terminal(rows, cols, score_cols, win_count) && !node->is_fully_expanded)
             {
-                node = expand(node, rows, cols, score_cols);
+                node = expand(node, rows, cols, score_cols, win_count);
             }
 
             double result = simulate(node->board, node->player_to_move, player, rows, cols, score_cols, win_count);
@@ -657,7 +750,7 @@ public:
     {
         int win_count = (int)score_cols.size();
 
-        int time_ms = std::min(400, std::max(100, (int)(my_time * 100)));
+        int time_ms = std::min(100, std::max(100, (int)(my_time * 100)));
 
         Move chosen_move = mcts_search(boardIn, side, rows, cols, score_cols, win_count, std::chrono::milliseconds(time_ms));
 
