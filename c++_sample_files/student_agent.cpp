@@ -846,7 +846,19 @@ class StudentAgent
 {
 public:
     explicit StudentAgent(std::string side, int history_size = 3)
-        : side(std::move(side)), max_history_size(history_size) {}
+        : side(std::move(side)), max_history_size(history_size), move_counter(0) {
+            // Define the opening moves here based on size
+            if (side == "circle") {
+                opening_moves = {
+                    
+                };
+            } else {
+                opening_moves = {
+                    
+                };
+            }
+
+        }
 
     std::vector<Move> generate_all_moves(const std::vector<std::vector<std::map<std::string, std::string>>> &board,
                                          int rows, int cols, const std::vector<int> &score_cols) const
@@ -876,6 +888,19 @@ public:
         CompactBoard board = to_compact(boardIn, rows, cols);
         uint8_t player = (side == "circle") ? OWNER_CIRCLE : OWNER_SQUARE;
 
+        if(move_counter < (int)opening_moves.size())
+        {
+            Move intended_move = opening_moves[move_counter];
+            if(is_valid_move(board, intended_move, player, rows, cols, score_cols) )
+            {
+                move_counter++;
+                add_to_history(intended_move);
+                std::cout << "OPENING MOVE\n";
+                return intended_move;
+            }
+            move_counter = 999 ; //skip rest of opening moves if one fails
+        }
+
         // Greedy check: if any move increases our stones-in-SA count, play it
         int before_SA = stones_in_SA(board, player, rows, cols, score_cols);
         auto all_moves = generate_all_moves_internal(board, player, rows, cols, score_cols);
@@ -903,6 +928,8 @@ private:
     std::string side;
     int max_history_size;
     std::vector<Move> move_history;
+    int move_counter;
+    vector<Move> opening_moves;
 
     bool moves_equal(const Move &a, const Move &b) const
     {
